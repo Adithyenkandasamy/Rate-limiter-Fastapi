@@ -1,80 +1,58 @@
-from fastapi import FastAPI, HTTPException, Depends, Query
-from sqlalchemy.orm import Session
-from typing import List, Optional
-import crud
-from models import get_db
-from schemas import ItemCreate, ItemUpdate, ItemResponse
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi_limiter import FastAPILimiter
+from fastapi_limiter.depends import RateLimiter
+import redis.asyncio as redis
+app = FastAPI(title="Production FastAPI with Rate Limiter")
 
-app = FastAPI(
-    title="FastAPI CRUD Application",
-    description="A basic CRUD application for managing items",
-    version="1.0.0"
-)
+# Startup and shutdown events for Redis + FastAPILimiter
+@app.on_event("startup")
+async def startup():
+    try:
+        r = redis.from_url(
+            "redis://127.0.0.1:6379",
+            encoding="utf-8",
+            decode_responses=True
+        )
+        await FastAPILimiter.init(r)
+        print("✅ Connected to Redis successfully.")
+    except Exception as e:
+        print("❌ Failed to connect to Redis:", e)
 
-@app.get("/")
-async def root():
-    """Root endpoint with API information"""
-    return {
-        "message": "Welcome to FastAPI CRUD Application",
-        "docs": "/docs",
-        "redoc": "/redoc"
-    }
+@app.on_event("shutdown")
+async def shutdown():
+    await FastAPILimiter.close()
+    print("🛑 Redis connection closed.")
 
-@app.post("/items/", response_model=ItemResponse)
-async def create_item(item: ItemCreate, db: Session = Depends(get_db)):
-    """Create a new item"""
-    return crud.create_item(db=db, item=item)
+# Public route (rate limit per IP)
+@app.get("/public", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
+async def public_route():
+    return {"message": "Public endpoint — 10 requests per minute allowed"}
 
-@app.get("/items/", response_model=List[ItemResponse])
-async def read_items(
-    skip: int = Query(0, ge=0, description="Number of items to skip"),
-    limit: int = Query(100, ge=1, le=1000, description="Number of items to return"),
-    db: Session = Depends(get_db)
-):
-    """Get all items with pagination"""
-    items = crud.get_items(db, skip=skip, limit=limit)
-    return items
+# API key authentication
+async def get_api_key(request: Request):
+    api_key = request.headers.get("x-api-key")
+    if api_key not in {"key123", "key456"}:
+        raise HTTPException(status_code=401, detail="Invalid API Key")
+    return api_key
 
-@app.get("/items/{item_id}", response_model=ItemResponse)
-async def read_item(item_id: int, db: Session = Depends(get_db)):
-    """Get a specific item by ID"""
-    db_item = crud.get_item(db, item_id=item_id)
-    if db_item is None:
-        raise HTTPException(status_code=404, detail="Item not found")
-    return db_item
+# Private route (rate limit per key)
+@app.get("/private", dependencies=[Depends(RateLimiter(times=5, seconds=60))])
+async def private_route(api_key: str = Depends(get_api_key)):
+    return {"message": f"Private route for API key {api_key}"}
 
-@app.put("/items/{item_id}", response_model=ItemResponse)
-async def update_item(item_id: int, item: ItemUpdate, db: Session = Depends(get_db)):
-    """Update an existing item"""
-    db_item = crud.update_item(db, item_id=item_id, item_update=item)
-    if db_item is None:
-        raise HTTPException(status_code=404, detail="Item not found")
-    return db_item
-
-@app.delete("/items/{item_id}")
-async def delete_item(item_id: int, db: Session = Depends(get_db)):
-    """Delete an item"""
-    success = crud.delete_item(db, item_id=item_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Item not found")
-    return {"message": "Item deleted successfully"}
-
-@app.get("/items/search/", response_model=List[ItemResponse])
-async def search_items(
-    q: str = Query(..., description="Search query for item name or description"),
-    skip: int = Query(0, ge=0, description="Number of items to skip"),
-    limit: int = Query(100, ge=1, le=1000, description="Number of items to return"),
-    db: Session = Depends(get_db)
-):
-    """Search items by name or description"""
-    items = crud.search_items(db, query=q, skip=skip, limit=limit)
-    return items
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy"}
+# Custom rate-limit handler
+@app.exception_handler(429)
+async def rate_limit_handler(request: Request, exc):
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "Rate limit exceeded",
+            "retry_after": request.headers.get("Retry-After", "60"),
+            "message": "Please try again later."
+        },
+    )
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
